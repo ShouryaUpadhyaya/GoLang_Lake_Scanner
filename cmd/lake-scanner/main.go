@@ -19,7 +19,6 @@ import (
 
 const defaultDB = "postgres://shouryaupadhyaya@/lake_scanner?host=/run/postgresql"
 
-// Output line: the record plus whether the catalog saw it as new/changed.
 type line struct {
 	scanner.FileRecord
 	State catalog.State `json:"state"`
@@ -30,13 +29,11 @@ func main() {
 	timeout := flag.Duration("timeout", 30*time.Second, "time limit per file")
 	flag.Parse()
 
-	// Check the arguments BEFORE indexing into them.
 	if flag.NArg() < 1 {
 		fmt.Fprintln(os.Stderr, "usage: lake-scanner [-workers N] [-timeout 30s] <root-directory>")
 		os.Exit(1)
 	}
 
-	// ctx is cancelled when the user presses Ctrl-C (or SIGTERM is sent).
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -57,30 +54,58 @@ func run(ctx context.Context, root string, workers int, timeout time.Duration) e
 	}
 	defer cat.Close()
 
-	enc := json.NewEncoder(os.Stdout) // writes one JSON value + newline per Encode
+	enc := json.NewEncoder(os.Stdout)
 	counts := map[catalog.State]int{}
 
-	// Phase 1: walk + hash + record in the catalog.
-	err = scanner.Walk(root,
-		func(rec scanner.FileRecord) error {
-			if err := ctx.Err(); err != nil { // stop walking on Ctrl-C
-				return err
-			}
-			state, err := cat.Upsert(ctx, rec.Path, rec.Hash, rec.Size)
-			if err != nil {
-				return err
-			}
-			counts[state]++
-			return enc.Encode(line{rec, state})
-		},
-		func(path string, err error) {
-			fmt.Fprintf(os.Stderr, "skip %s: %v\n", path, err)
-		})
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var firstErr error
+	fail := func(err error) {
+		if firstErr == nil {
+			firstErr = err
+			cancel()
+		}
+	}
+
+	entries, err := scanner.List(root, func(path string, err error) {
+		fmt.Fprintf(os.Stderr, "skip %s: %v\n", path, err)
+	})
 	if err != nil {
 		return err
 	}
 
-	// Phase 2: classify everything unclassified, concurrently.
+	hashOne := func(ctx context.Context, e scanner.Entry) (string, error) {
+		return scanner.HashFile(ctx, e.Path)
+	}
+	for r := range pool.Run(runCtx, workers, timeout, entries, hashOne) {
+		if firstErr != nil {
+			continue
+		}
+		if r.Err != nil {
+			if !errors.Is(r.Err, context.Canceled) {
+				fmt.Fprintf(os.Stderr, "skip %s: %v\n", r.Input.Path, r.Err)
+			}
+			continue
+		}
+		rec := scanner.FileRecord{Path: r.Input.Path, Size: r.Input.Size, Hash: r.Output}
+		state, err := cat.Upsert(ctx, rec.Path, rec.Hash, rec.Size)
+		if err != nil {
+			fail(err)
+			continue
+		}
+		counts[state]++
+		if err := enc.Encode(line{rec, state}); err != nil {
+			fail(err)
+		}
+	}
+	if firstErr != nil {
+		return firstErr
+	}
+	if err := ctx.Err(); err != nil {
+		fmt.Fprintln(os.Stderr, "interrupted: unfinished files will be retried next run")
+		return nil
+	}
+
 	pending, err := cat.Unclassified(ctx)
 	if err != nil {
 		return err
@@ -88,35 +113,41 @@ func run(ctx context.Context, root string, workers int, timeout time.Duration) e
 	var clf classify.Classifier = classify.New()
 	classifyOne := func(ctx context.Context, p catalog.Pending) (classify.Result, error) {
 		res := clf.Classify(ctx, p.Path)
-		// If our time ran out (or Ctrl-C hit) mid-job, the result can't be trusted.
 		return res, ctx.Err()
 	}
 
 	var done, failed int
-	for r := range pool.Run(ctx, workers, timeout, pending, classifyOne) {
+	for r := range pool.Run(runCtx, workers, timeout, pending, classifyOne) {
+		if firstErr != nil {
+			continue
+		}
 		p := r.Input
 		switch {
 		case errors.Is(r.Err, context.Canceled):
-			continue // interrupted: leave it unclassified; next run retries it
+			continue
 		case r.Err != nil:
 			failed++
 			fmt.Fprintf(os.Stderr, "failed %s: %v\n", p.Path, r.Err)
 			if err := cat.SetError(ctx, p.Path, p.Hash, r.Err.Error()); err != nil {
-				return err
+				fail(err)
 			}
 			continue
 		}
 		done++
 		if err := cat.SetClassification(ctx, p.Path, p.Hash,
 			string(r.Output.Kind), r.Output.MIME, r.Output.Detail); err != nil {
-			return err
+			fail(err)
+			continue
 		}
 		if err := enc.Encode(struct {
 			Path string `json:"path"`
 			classify.Result
 		}{p.Path, r.Output}); err != nil {
-			return err
+			fail(err)
 		}
+	}
+	if firstErr != nil {
+		return firstErr
 	}
 
 	fmt.Fprintf(os.Stderr, "scan: %d new, %d changed, %d unchanged; classified %d, failed %d\n",

@@ -10,8 +10,6 @@ import (
 	"time"
 )
 
-// Probe mirrors the parts of ffprobe's JSON output we care about. Fields not
-// listed here are simply ignored by encoding/json.
 type Probe struct {
 	Streams []Stream `json:"streams"`
 	Format  Format   `json:"format"`
@@ -20,10 +18,10 @@ type Probe struct {
 type Stream struct {
 	Index     int    `json:"index"`
 	CodecName string `json:"codec_name"`
-	CodecType string `json:"codec_type"` // "video" or "audio"
+	CodecType string `json:"codec_type"`
 	Width     int    `json:"width,omitempty"`
 	Height    int    `json:"height,omitempty"`
-	// ffprobe prints numbers like duration as strings, so we keep strings.
+
 	Duration   string `json:"duration,omitempty"`
 	SampleRate string `json:"sample_rate,omitempty"`
 }
@@ -44,8 +42,6 @@ func (p *Probe) has(t string) bool {
 func (p *Probe) HasVideo() bool { return p.has("video") }
 func (p *Probe) HasAudio() bool { return p.has("audio") }
 
-// RunProbe runs ffprobe with a timeout. CommandContext kills the process if
-// the context expires, so a hung ffprobe can't hang the scanner.
 func RunProbe(ctx context.Context, timeout time.Duration, path string) (*Probe, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()

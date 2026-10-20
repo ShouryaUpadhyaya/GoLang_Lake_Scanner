@@ -1,4 +1,3 @@
--- Catalog of every file the scanner has seen, keyed by content hash + path.
 CREATE TABLE IF NOT EXISTS files (
     id          BIGSERIAL PRIMARY KEY,
     sha256      CHAR(64)    NOT NULL,
