@@ -1,7 +1,6 @@
 package scanner
 
 import (
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
@@ -16,24 +15,7 @@ type FileRecord struct {
 	Hash string `json:"hash"`
 }
 
-type Entry struct {
-	Path string
-	Size int64
-}
-
-type ctxReader struct {
-	ctx context.Context
-	r   io.Reader
-}
-
-func (c ctxReader) Read(p []byte) (int, error) {
-	if err := c.ctx.Err(); err != nil {
-		return 0, err
-	}
-	return c.r.Read(p)
-}
-
-func HashFile(ctx context.Context, path string) (string, error) {
+func HashFile(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
@@ -41,15 +23,14 @@ func HashFile(ctx context.Context, path string) (string, error) {
 	defer f.Close()
 
 	h := sha256.New()
-	if _, err := io.Copy(h, ctxReader{ctx, f}); err != nil {
+	if _, err := io.Copy(h, f); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func List(root string, onErr func(path string, err error)) ([]Entry, error) {
-	var entries []Entry
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+func Walk(root string, fn func(FileRecord) error, onErr func(path string, err error)) error {
+	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			onErr(path, err)
 			return nil
@@ -62,8 +43,11 @@ func List(root string, onErr func(path string, err error)) ([]Entry, error) {
 			onErr(path, err)
 			return nil
 		}
-		entries = append(entries, Entry{Path: path, Size: info.Size()})
-		return nil
+		hash, err := HashFile(path)
+		if err != nil {
+			onErr(path, err)
+			return nil
+		}
+		return fn(FileRecord{Path: path, Size: info.Size(), Hash: hash})
 	})
-	return entries, err
 }

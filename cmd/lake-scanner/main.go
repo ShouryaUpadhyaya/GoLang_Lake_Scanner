@@ -57,53 +57,23 @@ func run(ctx context.Context, root string, workers int, timeout time.Duration) e
 	enc := json.NewEncoder(os.Stdout)
 	counts := map[catalog.State]int{}
 
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	var firstErr error
-	fail := func(err error) {
-		if firstErr == nil {
-			firstErr = err
-			cancel()
-		}
-	}
-
-	entries, err := scanner.List(root, func(path string, err error) {
-		fmt.Fprintf(os.Stderr, "skip %s: %v\n", path, err)
-	})
+	err = scanner.Walk(root,
+		func(rec scanner.FileRecord) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			state, err := cat.Upsert(ctx, rec.Path, rec.Hash, rec.Size)
+			if err != nil {
+				return err
+			}
+			counts[state]++
+			return enc.Encode(line{rec, state})
+		},
+		func(path string, err error) {
+			fmt.Fprintf(os.Stderr, "skip %s: %v\n", path, err)
+		})
 	if err != nil {
 		return err
-	}
-
-	hashOne := func(ctx context.Context, e scanner.Entry) (string, error) {
-		return scanner.HashFile(ctx, e.Path)
-	}
-	for r := range pool.Run(runCtx, workers, timeout, entries, hashOne) {
-		if firstErr != nil {
-			continue
-		}
-		if r.Err != nil {
-			if !errors.Is(r.Err, context.Canceled) {
-				fmt.Fprintf(os.Stderr, "skip %s: %v\n", r.Input.Path, r.Err)
-			}
-			continue
-		}
-		rec := scanner.FileRecord{Path: r.Input.Path, Size: r.Input.Size, Hash: r.Output}
-		state, err := cat.Upsert(ctx, rec.Path, rec.Hash, rec.Size)
-		if err != nil {
-			fail(err)
-			continue
-		}
-		counts[state]++
-		if err := enc.Encode(line{rec, state}); err != nil {
-			fail(err)
-		}
-	}
-	if firstErr != nil {
-		return firstErr
-	}
-	if err := ctx.Err(); err != nil {
-		fmt.Fprintln(os.Stderr, "interrupted: unfinished files will be retried next run")
-		return nil
 	}
 
 	pending, err := cat.Unclassified(ctx)
@@ -113,14 +83,12 @@ func run(ctx context.Context, root string, workers int, timeout time.Duration) e
 	var clf classify.Classifier = classify.New()
 	classifyOne := func(ctx context.Context, p catalog.Pending) (classify.Result, error) {
 		res := clf.Classify(ctx, p.Path)
+
 		return res, ctx.Err()
 	}
 
 	var done, failed int
-	for r := range pool.Run(runCtx, workers, timeout, pending, classifyOne) {
-		if firstErr != nil {
-			continue
-		}
+	for r := range pool.Run(ctx, workers, timeout, pending, classifyOne) {
 		p := r.Input
 		switch {
 		case errors.Is(r.Err, context.Canceled):
@@ -129,25 +97,21 @@ func run(ctx context.Context, root string, workers int, timeout time.Duration) e
 			failed++
 			fmt.Fprintf(os.Stderr, "failed %s: %v\n", p.Path, r.Err)
 			if err := cat.SetError(ctx, p.Path, p.Hash, r.Err.Error()); err != nil {
-				fail(err)
+				return err
 			}
 			continue
 		}
 		done++
 		if err := cat.SetClassification(ctx, p.Path, p.Hash,
 			string(r.Output.Kind), r.Output.MIME, r.Output.Detail); err != nil {
-			fail(err)
-			continue
+			return err
 		}
 		if err := enc.Encode(struct {
 			Path string `json:"path"`
 			classify.Result
 		}{p.Path, r.Output}); err != nil {
-			fail(err)
+			return err
 		}
-	}
-	if firstErr != nil {
-		return firstErr
 	}
 
 	fmt.Fprintf(os.Stderr, "scan: %d new, %d changed, %d unchanged; classified %d, failed %d\n",
